@@ -14,6 +14,15 @@
   .chip { padding:4px 10px; border:1px solid #333; border-radius:999px; font-size:12px; cursor:pointer; user-select:none; }
   .chip.on { color:var(--accent); border-color:var(--accent); }
   #out { min-height:86px; flex:1; background:#0f0f0f; color:var(--fg); border:1px solid #242424; border-radius:6px; padding:10px; }
+
+  /* tuning HUD */
+  .ctrl {
+    position: fixed; right: 10px; bottom: 10px; background: #0a0a0acc;
+    border:1px solid #222; border-radius:10px; padding:8px 10px; z-index:20; backdrop-filter: blur(4px);
+  }
+  .ctrl label { display:grid; grid-template-columns:auto 60px; gap:8px; align-items:center; font-size:12px; margin:4px 0; }
+  .ctrl input[type="range"] { width: 140px; }
+  .ctrl small { opacity:.7; }
 </style>
 
 <div class="wrap">
@@ -34,6 +43,16 @@
   </footer>
 </div>
 
+<!-- tuning HUD -->
+<div class="ctrl" id="ctrl">
+  <label>attract <input id="kAttr" type="range" min="0" max="0.6" step="0.01"></label>
+  <label>sug pull<input id="kSug"  type="range" min="0" max="0.6" step="0.01"></label>
+  <label>noise   <input id="kNoise" type="range" min="0" max="0.5" step="0.005"></label>
+  <label>max spd <input id="kSpd"  type="range" min="0.4" max="4" step="0.05"></label>
+  <label>pop     <input id="kPop"  type="range" min="120" max="2000" step="40"></label>
+  <small>two-finger: pan/zoom · one-finger: seed/slide · “swarm” toggles commit</small>
+</div>
+
 <script>
 /* ========================= CONFIG ========================= */
 const HEX_RINGS = 4;                 // radius -> rows 5..9..5
@@ -52,13 +71,13 @@ const LEX = {
 };
 const CONT = ["and","then",",",".","here","now"];
 
-/* swarm */
-const SWARM_COUNT = 24000;
-const SWARM_ATTR_TOUCH = 0.22;   // attraction to hover
-const SWARM_ATTR_SUG   = 0.18;   // attraction to active suggestion cells
-const SWARM_NOISE      = 0.12;   // wander
-const SWARM_MAXSPD     = 1.8;
-const SWARM_COMMIT_RADIUS = 28;  // px around cell center
+/* swarm (initial; live-tunable via sliders) */
+let SWARM_COUNT = 240;
+let SWARM_ATTR_TOUCH = 0.22;   // attraction to hover
+let SWARM_ATTR_SUG   = 0.18;   // attraction to active suggestion cells
+let SWARM_NOISE      = 0.12;   // wander
+let SWARM_MAXSPD     = 1.8;
+const SWARM_COMMIT_RADIUS = 28;   // px around cell center
 const SWARM_COMMIT_THRESHOLD = 14; // agents within radius to pulse
 let SWARM_MODE = 0; // 0=solo (draw only), 1=chorus (may auto-commit)
 
@@ -77,6 +96,13 @@ function fit() {
   for(const c of canvases){ c.width=W*dpr; c.height=H*dpr; c.getContext('2d').setTransform(dpr,0,0,dpr,0,0); }
 }
 window.addEventListener('resize', fit); fit();
+
+/* ========================= CAMERA ========================= */
+let cam = { x: 0, y: 0, z: 1 };
+const ZMIN = 0.05, ZMAX = 50;
+function centerCam(){ cam.x=W/2; cam.y=H/2; cam.z=1; } centerCam();
+function toView(x,y){ return { x:(x-cam.x)/cam.z + W/2, y:(y-cam.y)/cam.z + H/2 }; }
+function toWorld(x,y){ return { x:(x-W/2)*cam.z + cam.x, y:(y-H/2)*cam.z + cam.y }; }
 
 /* ===================== HEX COORDINATES ==================== */
 const SQRT3 = Math.sqrt(3);
@@ -115,7 +141,6 @@ function centers(){
 let {L:CL,R:CR}=centers();
 let HIVE_L=buildHive(CL.cx,CL.cy,HEX_RINGS);
 let HIVE_R=buildHive(CR.cx,CR.cy,HEX_RINGS);
-
 function rebuild(){ ({L:CL,R:CR}=centers()); HIVE_L=buildHive(CL.cx,CL.cy,HEX_RINGS); HIVE_R=buildHive(CR.cx,CR.cy,HEX_RINGS); drawAll(); }
 
 /* ========================= RENDERING ====================== */
@@ -146,12 +171,20 @@ function drawHive(ctx,hive){
   }
   ctx.restore();
 }
-function drawAll(){ cg.clearRect(0,0,W,H); drawHive(cg,HIVE_L); drawHive(cg,HIVE_R); }
+function drawAll(){
+  cg.setTransform(1,0,0,1,0,0);
+  cg.clearRect(0,0,W,H);
+  cg.save();
+  cg.translate(W/2, H/2); cg.scale(1/cam.z, 1/cam.z); cg.translate(-cam.x, -cam.y);
+  drawHive(cg,HIVE_L); drawHive(cg,HIVE_R);
+  cg.restore();
+}
 
 /* ===================== INTERACTION STATE ================== */
 let dragging=false, pressTimer=null, hiveCurr=null;
 let seeded=null, current=null;
-let hover=null;
+let hoverWorld=null;        // swarm forces use this
+let hoverScreen=null;       // halo visual
 const V = pat => navigator.vibrate && navigator.vibrate(pat);
 
 function whichHive(x,y){ const dl=Math.hypot(x-CL.cx,y-CL.cy), dr=Math.hypot(x-CR.cx,y-CR.cy); return dl<dr ? HIVE_L : HIVE_R; }
@@ -180,11 +213,10 @@ function append(tok){
   out.value=s; out.selectionStart=out.selectionEnd=s.length;
 }
 
-/* Hover / halo */
+/* Hover / halo (screen-space) */
 function drawHover(x,y){
   cu.clearRect(0,0,W,H);
   if(!x && !y) return;
-  // halo
   cu.save();
   const rad = HEX_SIZE*2.4;
   const grd = cu.createRadialGradient(x,y,4, x,y, rad);
@@ -192,29 +224,10 @@ function drawHover(x,y){
   grd.addColorStop(1, "rgba(122,168,255,0.0)");
   cu.fillStyle = grd;
   cu.beginPath(); cu.arc(x,y,rad,0,6.283); cu.fill();
-  // focus dot
   cu.fillStyle="rgba(231,231,231,0.75)";
   cu.beginPath(); cu.arc(x,y,1.5,0,6.283); cu.fill();
   cu.restore();
 }
-
-/* input */
-function pt(ev){ const r=cg.canvas.getBoundingClientRect(); const e=ev.touches?ev.touches[0]:ev; return {x:e.clientX-r.left,y:e.clientY-r.top}; }
-function down(ev){
-  ev.preventDefault();
-  const {x,y}=pt(ev); hover={x,y}; drawHover(x,y);
-  hiveCurr = whichHive(x,y);
-  const hit = pick(hiveCurr,x,y); if(!hit) return;
-  pressTimer = setTimeout(()=>{ seeded=current=hit; bloom(hiveCurr,hit); V([8,18,8]); dragging=true; }, LONG_MS);
-}
-function move(ev){
-  const {x,y}=pt(ev); hover={x,y}; drawHover(x,y);
-  if(!dragging) return;
-  ev.preventDefault();
-  const hit = pick(hiveCurr,x,y);
-  if(hit && hit!==current && hit.active){ append(hit.token); current=hit; bloom(hiveCurr,hit); V(12); }
-}
-function up(){ clearTimeout(pressTimer); pressTimer=null; dragging=false; }
 
 /* ========================= SWARM ========================== */
 const agents = [];
@@ -238,15 +251,62 @@ function activeCells(){
   return list;
 }
 
-function stepSwarm(){
+/* post-processing target */
+const swOff = document.createElement('canvas'); const swCtx = swOff.getContext('2d');
+function syncSwOff(){ swOff.width=W; swOff.height=H; } syncSwOff(); window.addEventListener('resize', syncSwOff);
+let USE_SW_POST = true;
+
+function applySwarmPost(){
+  if(!USE_SW_POST) return;
+  swCtx.setTransform(1,0,0,1,0,0);
+  swCtx.clearRect(0,0,W,H);
+  swCtx.drawImage(cs.canvas,0,0);
+
+  // monochrome + contrast curve
+  const img = swCtx.getImageData(0,0,W,H); const d=img.data;
+  for(let i=0;i<d.length;i+=4){
+    const r=d[i], g=d[i+1], b=d[i+2];
+    let y = 0.2126*r + 0.7152*g + 0.0722*b;
+    y = Math.pow(y/255, 0.9) * 255;
+    d[i]=d[i+1]=d[i+2]=y;
+  }
+  swCtx.putImageData(img,0,0);
+
+  // glow
+  swCtx.globalCompositeOperation='lighter';
+  swCtx.filter='blur(2px)'; swCtx.drawImage(swOff,0,0);
+  swCtx.filter='blur(5px)'; swCtx.drawImage(swOff,0,0);
+  swCtx.filter='none'; swCtx.globalCompositeOperation='source-over';
+
+  // grain
+  const gimg = swCtx.getImageData(0,0,W,H); const gd=gimg.data;
+  const npx=(W*H*0.08)|0;
+  for(let k=0;k<npx;k++){
+    const p=((Math.random()*W)|0 + ((Math.random()*H)|0)*W)<<2;
+    const n=(Math.random()*34-17)|0;
+    gd[p]=gd[p+1]=gd[p+2]=Math.max(0,Math.min(255,gd[p]+n));
+  }
+  swCtx.putImageData(gimg,0,0);
+
+  // present to visible canvas
+  cs.setTransform(1,0,0,1,0,0);
   cs.clearRect(0,0,W,H);
+  cs.drawImage(swOff,0,0);
+}
+
+function stepSwarm(){
+  cs.setTransform(1,0,0,1,0,0);
+  cs.clearRect(0,0,W,H);
+
+  // draw in world space
+  cs.save();
+  cs.translate(W/2, H/2); cs.scale(1/cam.z, 1/cam.z); cs.translate(-cam.x, -cam.y);
+
   const actives = activeCells();
-  // count for commit pulses
   const crowd = new Map(); // cell -> count
-  const nowHover = hover;
+  const nowHover = hoverWorld;
 
   for(const a of agents){
-    // forces
     let ax=0, ay=0;
 
     // attraction to hover field (your touch)
@@ -264,9 +324,8 @@ function stepSwarm(){
       const f = SWARM_ATTR_SUG * Math.min(1, 120/d);
       ax += f * dx; ay += f * dy;
 
-      // crowd count for commit
       if(d < SWARM_COMMIT_RADIUS){
-        const id = c; crowd.set(id, (crowd.get(id)||0)+1);
+        crowd.set(c, (crowd.get(c)||0)+1);
       }
     }
 
@@ -288,7 +347,7 @@ function stepSwarm(){
     cs.beginPath(); cs.arc(a.x,a.y,1.1,0,6.283); cs.fill();
   }
 
-  // pulse cells with enough swarm nearby; in chorus, auto-commit
+  // pulses + chorus
   for(const [cell,count] of crowd.entries()){
     if(count >= SWARM_COMMIT_THRESHOLD){
       pulseCell(cell);
@@ -296,14 +355,25 @@ function stepSwarm(){
     }
   }
 
+  cs.restore();
+  applySwarmPost();
   requestAnimationFrame(stepSwarm);
 }
 requestAnimationFrame(stepSwarm);
 
 function pulseCell(c){
   cu.save();
+  const v = toView(c.x,c.y);
   cu.strokeStyle="rgba(122,168,255,0.45)";
-  cu.lineWidth=3; hexPath(cu,c.x,c.y); cu.stroke();
+  cu.lineWidth=3;
+  // pulse outline in screen space for readability
+  cu.beginPath();
+  for(let i=0;i<6;i++){
+    const a=Math.PI/6 + i*Math.PI/3;
+    const px=v.x+HEX_SIZE*Math.cos(a), py=v.y+HEX_SIZE*Math.sin(a);
+    (i?cu.lineTo:cu.moveTo).call(cu,px,py);
+  }
+  cu.closePath(); cu.stroke();
   cu.restore();
 }
 
@@ -313,9 +383,11 @@ document.getElementById('clear').onclick=()=>{ out.value=""; };
 document.getElementById('cal').onclick=async()=>{
   alert("Calibration: tap once where your LEFT thumb naturally rests, then tap where your RIGHT thumb rests.");
   const pickTap=()=>new Promise(res=>{
-    const handler=e=>{ const {x,y}=pt(e); window.removeEventListener('mousedown',handler); window.removeEventListener('touchstart',handler); res({x,y}); };
+    const handler=e=>{ const r=cg.canvas.getBoundingClientRect(); const t=e.touches?e.touches[0]:e;
+      const x=t.clientX-r.left, y=t.clientY-r.top; window.removeEventListener('mousedown',handler);
+      window.removeEventListener('touchstart',handler); res(toWorld(x,y)); };
     window.addEventListener('mousedown',handler,{once:true});
-    window.addEventListener('touchstart',handler,{once:true});
+    window.addEventListener('touchstart',handler,{once:true,passive:false});
   });
   const L=await pickTap(); const R=await pickTap();
   CL={cx:L.x, cy:L.y}; CR={cx:R.x, cy:R.y};
@@ -327,11 +399,120 @@ modeBtn.onclick=()=>{ SWARM_MODE = (SWARM_MODE+1)%2; modeBtn.classList.toggle('o
 function drawAllAndStart(){ drawAll(); initSwarm(); }
 drawAllAndStart();
 
-/* input listeners last */
-cg.canvas.addEventListener('mousedown',down);
-cg.canvas.addEventListener('touchstart',down,{passive:false});
-window.addEventListener('mousemove',move);
-window.addEventListener('touchmove',move,{passive:false});
-window.addEventListener('mouseup',up);
-window.addEventListener('touchend',up);
+/* ============== INPUT / GESTURES (camera + seeds) ========= */
+function ptScreen(ev){
+  const r=cg.canvas.getBoundingClientRect();
+  const e=ev.touches?ev.touches[0]:ev;
+  return {x:e.clientX-r.left, y:e.clientY-r.top};
+}
+function ptWorld(ev){ const s=ptScreen(ev); return toWorld(s.x,s.y); }
+
+function down(ev){
+  ev.preventDefault();
+  const s = ptScreen(ev); const w = ptWorld(ev);
+  hoverScreen=s; hoverWorld=w; drawHover(s.x,s.y);
+  hiveCurr = whichHive(w.x,w.y);
+  const hit = pick(hiveCurr,w.x,w.y); if(!hit) return;
+  pressTimer = setTimeout(()=>{ seeded=current=hit; bloom(hiveCurr,hit); V([8,18,8]); dragging=true; }, LONG_MS);
+}
+function move(ev){
+  const s = ptScreen(ev); const w = ptWorld(ev);
+  hoverScreen=s; hoverWorld=w; drawHover(s.x,s.y);
+  if(!dragging) return;
+  ev.preventDefault();
+  const hit = pick(hiveCurr,w.x,w.y);
+  if(hit && hit!==current && hit.active){ append(hit.token); current=hit; bloom(hiveCurr,hit); V(12); }
+}
+function up(){ clearTimeout(pressTimer); pressTimer=null; dragging=false; }
+
+/* Touch gestures: two-finger pan/zoom camera */
+let pinch=null; // {id1,id2,startDist,startZ,anchorWorld,lastMid}
+
+cg.canvas.addEventListener('touchstart', (e)=>{
+  e.preventDefault();
+  if (e.touches.length===2){ clearTimeout(pressTimer); dragging=false; }
+  if (e.touches.length===1) down(e);
+
+  if (e.touches.length===2){
+    const r=cg.canvas.getBoundingClientRect();
+    const a={x:e.touches[0].clientX-r.left, y:e.touches[0].clientY-r.top};
+    const b={x:e.touches[1].clientX-r.left, y:e.touches[1].clientY-r.top};
+    const mid={x:(a.x+b.x)/2, y:(a.y+b.y)/2};
+    pinch = {
+      id1:e.touches[0].identifier, id2:e.touches[1].identifier,
+      startDist: Math.hypot(a.x-b.x, a.y-b.y),
+      startZ: cam.z,
+      anchorWorld: toWorld(mid.x, mid.y),
+      lastMid: mid
+    };
+  }
+},{passive:false});
+
+window.addEventListener('touchmove', (e)=>{
+  if (pinch){
+    e.preventDefault();
+    const r=cg.canvas.getBoundingClientRect();
+    let A=null,B=null;
+    for (const t of e.touches){
+      if (t.identifier===pinch.id1) A={x:t.clientX-r.left,y:t.clientY-r.top};
+      if (t.identifier===pinch.id2) B={x:t.clientX-r.left,y:t.clientY-r.top};
+    }
+    if (A && B){
+      const mid={x:(A.x+B.x)/2, y:(A.y+B.y)/2};
+      const d=Math.hypot(A.x-B.x, A.y-B.y);
+      cam.z = Math.max(ZMIN, Math.min(ZMAX, pinch.startZ * (pinch.startDist / d)));
+      const before = pinch.anchorWorld;
+      const after  = toWorld(mid.x, mid.y);
+      cam.x += before.x - after.x;
+      cam.y += before.y - after.y;
+      cam.x -= (mid.x - pinch.lastMid.x) * cam.z;
+      cam.y -= (mid.y - pinch.lastMid.y) * cam.z;
+      pinch.lastMid = mid;
+      drawAll();
+    }
+    return;
+  }
+  move(e);
+},{passive:false});
+
+window.addEventListener('touchend', (e)=>{
+  if (pinch){
+    let still=false;
+    for (const t of e.touches) if (t.identifier===pinch.id1 || t.identifier===pinch.id2) still=true;
+    if (!still) pinch=null;
+  }
+  up();
+});
+
+/* Mouse (desktop) */
+cg.canvas.addEventListener('mousedown', down);
+window.addEventListener('mousemove', move);
+window.addEventListener('mouseup', up);
+
+/* ============== TUNING HUD WIRING ========================= */
+(function(){
+  const $=id=>document.getElementById(id);
+  $('kAttr').value = SWARM_ATTR_TOUCH;
+  $('kSug').value  = SWARM_ATTR_SUG;
+  $('kNoise').value= SWARM_NOISE;
+  $('kSpd').value  = SWARM_MAXSPD;
+  $('kPop').value  = SWARM_COUNT;
+
+  $('kAttr').oninput = e => window.SWARM_ATTR_TOUCH = parseFloat(e.target.value);
+  $('kSug').oninput  = e => window.SWARM_ATTR_SUG   = parseFloat(e.target.value);
+  $('kNoise').oninput= e => window.SWARM_NOISE      = parseFloat(e.target.value);
+  $('kSpd').oninput  = e => window.SWARM_MAXSPD     = parseFloat(e.target.value);
+
+  $('kPop').oninput  = e => {
+    const target = parseInt(e.target.value,10);
+    if (target > agents.length){
+      const add = target - agents.length;
+      for(let i=0;i<add;i++)
+        agents.push({ x:Math.random()*W, y:Math.random()*H, vx:(Math.random()*2-1)*0.5, vy:(Math.random()*2-1)*0.5, hue:200+Math.random()*40 });
+    } else if (target < agents.length){
+      agents.splice(0, agents.length - target);
+    }
+    SWARM_COUNT = target;
+  };
+})();
 </script>
