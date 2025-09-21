@@ -1,0 +1,288 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Horde Keyboard — first build</title>
+<style>
+  :root { --bg:#0b0b0b; --fg:#e7e7e7; --stroke:#2a2a2a; --accent:#7aa8ff; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .wrap { display:grid; grid-template-rows:auto 1fr auto; height:100%; }
+  header, footer { padding:8px 12px; border-bottom:1px solid var(--stroke); }
+  footer { border-top:1px solid var(--stroke); border-bottom:none; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .stack { position:relative; overflow:hidden; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+  .chip { padding:4px 10px; border:1px solid #333; border-radius:999px; font-size:12px; cursor:pointer; user-select:none; }
+  .chip.on { color:var(--accent); border-color:var(--accent); }
+  #out { min-height:86px; flex:1; background:#0f0f0f; color:var(--fg); border:1px solid #242424; border-radius:6px; padding:10px; }
+</style>
+
+<div class="wrap">
+  <header>horde keyboard • long-press seed • slide to walk • pure hex • v0</header>
+
+  <!-- one field, many layers -->
+  <div class="stack">
+    <canvas id="grid"></canvas>    <!-- hex geometry + tokens -->
+    <canvas id="ui"></canvas>      <!-- hover halo, selection glow -->
+  </div>
+
+  <footer>
+    <span class="chip" id="swap">swap hands</span>
+    <span class="chip" id="cal">recalibrate</span>
+    <span class="chip" id="clear">clear</span>
+    <textarea id="out" placeholder="your sentence appears here…"></textarea>
+  </footer>
+</div>
+
+<script>
+/* ========================= CONFIG ========================= */
+const HEX_RINGS = 4;                 // radius → rows 5..9..5 (true hex)
+const HEX_SIZE = 36;                 // px edge size
+const LONG_MS  = 380;                // long-press to seed
+const SEED     = "•";                // seed mark
+
+// First ring: human impulses
+const IMPULSES = ["Explore","Question","Decide","Act","Exist","Again"];
+const LEX = {
+  Explore:["maybe","wander","open","beyond","try","else"],
+  Question:["why","what","how","if","could","when"],
+  Decide:["let's","choose","keep","stop","begin","return"],
+  Act:["make","build","send","move","speak","write"],
+  Exist:["i am","you are","this is","we are","it is","becomes"],
+  Again:["then","again","still","back","once","more"]
+};
+const CONT = ["and","then",",",".","here","now"];
+
+/* ====================== CANVAS SETUP ====================== */
+const cg = document.getElementById('grid').getContext('2d');
+const cu = document.getElementById('ui').getContext('2d');
+const out = document.getElementById('out');
+const dpr = Math.max(1, window.devicePixelRatio||1);
+let W=0,H=0;
+
+function fit() {
+  const cvs=[cg.canvas,cu.canvas];
+  W = cvs[0].clientWidth = cvs[0].parentElement.clientWidth;
+  H = cvs[0].clientHeight= cvs[0].parentElement.clientHeight;
+  for(const c of cvs){ c.width=W*dpr; c.height=H*dpr; c.getContext('2d').setTransform(dpr,0,0,dpr,0,0); }
+}
+window.addEventListener('resize', fit); fit();
+
+/* ===================== HEX COORDINATES ==================== */
+// axial coords (q,r); s = -q-r
+const SQRT3 = Math.sqrt(3);
+function axialToPixel(q,r,cx,cy,hex=HEX_SIZE){
+  return { x: cx + hex*(SQRT3*q + SQRT3/2*r), y: cy + hex*(3/2*r) };
+}
+function neighborsQR(q,r){ return [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]].map(([dq,dr])=>[q+dq,r+dr]); }
+const k = (q,r)=>`${q},${r}`;
+
+/* ======================= HIVE MODEL ======================= */
+function buildHive(cx,cy,rings){
+  // generate true concentric hex rings up to 'rings'
+  const cells=new Map(); // key->cell
+  const arr=[];
+  // center
+  const c0={q:0,r:0, ...axialToPixel(0,0,cx,cy), token:SEED, kind:"seed", active:false};
+  cells.set(k(0,0),c0); arr.push(c0);
+  for(let n=1;n<=rings;n++){
+    // start at (n,0), then walk 6 dirs n steps each
+    let q=n, r=0;
+    const steps = [[0,-1],[-1,0],[-1,1],[0,1],[1,0],[1,-1]];
+    for(const [dq,dr] of steps){
+      for(let i=0;i<n;i++){
+        const cell = cells.get(k(q,r)) || (()=> {
+          const p=axialToPixel(q,r,cx,cy); const c={q,r,x:p.x,y:p.y,token:"",kind:"",active:false};
+          cells.set(k(q,r),c); arr.push(c); return c;
+        })();
+        q+=dq; r+=dr;
+      }
+    }
+  }
+  // boundary path for outline (pure hex)
+  const boundary=[];
+  let q=rings, r=0;
+  const dirs=[[0,-1],[-1,0],[-1,1],[0,1],[1,0],[1,-1]];
+  for(const [dq,dr] of dirs){
+    for(let i=0;i<rings;i++){ const p=axialToPixel(q,r,cx,cy); boundary.push(p); q+=dq; r+=dr; }
+  }
+  return {cells, arr, boundary, center:{cx,cy}, rings};
+}
+
+/* ===================== DUAL HIVE LAYOUT =================== */
+let leftHigher=true;
+function centers(){
+  const vw=W, vh=H;
+  if(leftHigher){
+    return { L:{cx: 0.33*vw, cy: 0.78*vh}, R:{cx: 0.67*vw, cy: 0.825*vh} };
+  } else {
+    return { L:{cx: 0.33*vw, cy: 0.825*vh}, R:{cx: 0.67*vw, cy: 0.78*vh} };
+  }
+}
+let {L:CL, R:CR} = centers();
+let HIVE_L = buildHive(CL.cx, CL.cy, HEX_RINGS);
+let HIVE_R = buildHive(CR.cx, CR.cy, HEX_RINGS);
+
+function rebuild(){ ({L:CL,R:CR}=centers()); HIVE_L=buildHive(CL.cx,CL.cy,HEX_RINGS); HIVE_R=buildHive(CR.cx,CR.cy,HEX_RINGS); drawAll(); }
+
+/* ========================= RENDERING ====================== */
+function hexPath(ctx,x,y,hex=HEX_SIZE){
+  ctx.beginPath();
+  for(let i=0;i<6;i++){
+    const a=Math.PI/6 + i*Math.PI/3;
+    const px=x+hex*Math.cos(a), py=y+hex*Math.sin(a);
+    (i?ctx.lineTo:ctx.moveTo).call(ctx,px,py);
+  }
+  ctx.closePath();
+}
+function drawHive(ctx,hive){
+  // outline
+  ctx.save();
+  ctx.strokeStyle="#333"; ctx.lineWidth=1.2;
+  ctx.beginPath();
+  hive.boundary.forEach((p,i)=> (i?ctx.lineTo:ctx.moveTo).call(ctx,p.x,p.y));
+  ctx.closePath(); ctx.stroke();
+  // cells
+  for(const c of hive.arr){
+    const isActive = c.active || c.kind==="seed";
+    ctx.fillStyle = isActive ? "rgba(122,168,255,0.08)" : "transparent";
+    hexPath(ctx,c.x,c.y); ctx.fill();
+    ctx.strokeStyle = isActive ? "#888" : "#333"; ctx.lineWidth = 1;
+    ctx.stroke();
+    if(c.token){
+      ctx.fillStyle="#e7e7e7"; ctx.font="12px ui-monospace,Menlo,monospace";
+      ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.fillText(c.token, c.x, c.y);
+    }
+  }
+  ctx.restore();
+}
+function drawAll(){
+  cg.clearRect(0,0,W,H);
+  drawHive(cg,HIVE_L);
+  drawHive(cg,HIVE_R);
+  cu.clearRect(0,0,W,H);
+}
+drawAll();
+
+/* ===================== INTERACTION STATE ================== */
+let dragging=false, pressTimer=null;
+let seeded=null, current=null, hiveCurr=null;
+const V = pat => navigator.vibrate && navigator.vibrate(pat);
+
+function pick(hive, x,y){
+  let best=null, dmin=1e9;
+  for(const c of hive.arr){ const d=Math.hypot(x-c.x, y-c.y);
+    if( d < HEX_SIZE*0.9 && d<dmin ){ best=c; dmin=d; }
+  }
+  return best;
+}
+function whichHive(x,y){
+  const dl = Math.hypot(x-CL.cx,y-CL.cy), dr = Math.hypot(x-CR.cx,y-CR.cy);
+  return dl<dr ? HIVE_L : HIVE_R;
+}
+
+/* =================== BLOOM + TEXT RULES =================== */
+function resetActive(h){ h.arr.forEach(c=>c.active=false); }
+function neighborsOf(h,c){
+  return neighborsQR(c.q,c.r).map(([q,r])=> h.cells.get(`${q},${r}`)).filter(Boolean);
+}
+function bloom(h,cell){
+  resetActive(h);
+  const nbs = neighborsOf(h,cell);
+  nbs.forEach((n,i)=>{
+    n.active=true;
+    if(cell.kind==="seed"){ n.kind="impulse"; n.token=IMPULSES[i%IMPULSES.length]; }
+    else if(cell.kind==="impulse"){ n.kind="word"; n.token=(LEX[cell.token]||[])[i%6]||""; }
+    else { n.kind="word"; n.token=CONT[i%CONT.length]; }
+  });
+  drawAll();
+}
+function append(tok){
+  if(!tok) return;
+  const punct=[",",".",";","?","!"];
+  let s=out.value;
+  if(punct.includes(tok)) s=s.replace(/\s*$/,"")+tok+" ";
+  else if(s===""||/\s$/.test(s)) s+=tok+" ";
+  else s+=" "+tok+" ";
+  out.value=s; out.selectionStart=out.selectionEnd=s.length;
+}
+
+/* ======================= HOVER FIELD ====================== */
+let hover=null;
+function drawHover(x,y){
+  cu.clearRect(0,0,W,H);
+  if(!x && !y) return;
+  // irregular “thumb field”: squash vertically a bit and bias toward nearest hive center
+  const toL = Math.hypot(x-CL.cx,y-CL.cy), toR = Math.hypot(x-CR.cx,y-CR.cy);
+  const bias = toL<toR ? {cx:CL.cx,cy:CL.cy} : {cx:CR.cx,cy:CR.cy};
+  cu.save();
+  const rad = HEX_SIZE*2.2;
+  const grd = cu.createRadialGradient(x,y,4, x,y, rad);
+  grd.addColorStop(0, "rgba(122,168,255,0.25)");
+  grd.addColorStop(1, "rgba(122,168,255,0.0)");
+  cu.fillStyle = grd;
+  cu.translate(bias.cx, bias.cy);
+  const ang = Math.atan2(y-bias.cy, x-bias.cx);
+  cu.rotate(ang*0.08);            // tiny orientation bias
+  cu.scale(1.15, 0.9);            // slight irregularity, feels organic
+  cu.translate(-bias.cx, -bias.cy);
+  cu.beginPath(); cu.arc(x,y,rad,0,Math.PI*2); cu.fill();
+  // focus dot
+  cu.fillStyle="rgba(231,231,231,0.8)";
+  cu.beginPath(); cu.arc(x,y,1.5,0,6.283); cu.fill();
+  cu.restore();
+}
+
+/* ========================= INPUT ========================== */
+function pt(ev){
+  const r=cg.canvas.getBoundingClientRect();
+  const e=ev.touches?ev.touches[0]:ev;
+  return {x:e.clientX-r.left, y:e.clientY-r.top};
+}
+function down(ev){
+  ev.preventDefault();
+  const {x,y}=pt(ev); hover={x,y}; drawHover(x,y);
+  hiveCurr = whichHive(x,y);
+  const hit = pick(hiveCurr,x,y); if(!hit) return;
+  pressTimer = setTimeout(()=>{
+    seeded = current = hit; bloom(hiveCurr, hit); V([8,18,8]); dragging=true;
+  }, LONG_MS);
+}
+function move(ev){
+  if(!dragging){ const {x,y}=pt(ev); hover={x,y}; drawHover(x,y); return; }
+  ev.preventDefault();
+  const {x,y}=pt(ev); hover={x,y}; drawHover(x,y);
+  const hit = pick(hiveCurr,x,y);
+  if(hit && hit!==current && hit.active){
+    append(hit.token); current=hit; bloom(hiveCurr,hit); V(12);
+  }
+}
+function up(){
+  clearTimeout(pressTimer); pressTimer=null; dragging=false; hover=null; cu.clearRect(0,0,W,H);
+}
+cg.canvas.addEventListener('mousedown',down);
+cg.canvas.addEventListener('touchstart',down,{passive:false});
+window.addEventListener('mousemove',move);
+window.addEventListener('touchmove',move,{passive:false});
+window.addEventListener('mouseup',up);
+window.addEventListener('touchend',up);
+
+/* ==================== FOOTER CONTROLS ===================== */
+document.getElementById('swap').onclick=()=>{ leftHigher=!leftHigher; rebuild(); };
+document.getElementById('clear').onclick=()=>{ out.value=""; };
+document.getElementById('cal').onclick=async()=>{
+  // simple “thumb calibration”: ask for two taps, set centers to those taps
+  alert("Calibration: tap once where your LEFT thumb naturally rests, then tap where your RIGHT thumb rests.");
+  const pickTap=()=> new Promise(resolve=>{
+    const handler=(e)=>{ const {x,y}=pt(e); window.removeEventListener('mousedown',handler); window.removeEventListener('touchstart',handler); resolve({x,y}); };
+    window.addEventListener('mousedown',handler,{once:true});
+    window.addEventListener('touchstart',handler,{once:true});
+  });
+  const L=await pickTap(); const R=await pickTap();
+  CL={cx:L.x, cy:L.y}; CR={cx:R.x, cy:R.y};
+  HIVE_L=buildHive(CL.cx,CL.cy,HEX_RINGS); HIVE_R=buildHive(CR.cx,CR.cy,HEX_RINGS); drawAll();
+};
+
+/* ========================= START ========================== */
+drawAll();
+</script>
