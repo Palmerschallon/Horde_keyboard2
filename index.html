@@ -1,7 +1,7 @@
 <!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-<title>Horde — pure canvas, dual-touch</title>
+<title>Horde Keyboard — swarm attractors</title>
 <style>
   :root { --bg:#0b0b0b; --fg:#e7e7e7; --stroke:#2a2a2a; --accent:#7aa8ff; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
@@ -13,269 +13,325 @@
   canvas { position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none; }
   .chip { padding:4px 10px; border:1px solid #333; border-radius:999px; font-size:12px; cursor:pointer; user-select:none; }
   .chip.on { color:var(--accent); border-color:var(--accent); }
-  #out { min-height:70px; flex:1; background:#0f0f0f; color:var(--fg); border:1px solid #242424; border-radius:6px; padding:10px; }
+  #out { min-height:86px; flex:1; background:#0f0f0f; color:var(--fg); border:1px solid #242424; border-radius:6px; padding:10px; }
 </style>
 
 <div class="wrap">
-  <header>horde — pure canvas • dual-touch • expand/collapse • v0.2</header>
+  <header>horde keyboard • long-press seed • slide to walk • swarm feels your touch</header>
 
   <div class="stack">
-    <canvas id="void"></canvas>   <!-- swarm -->
-    <canvas id="ui"></canvas>     <!-- halos, overlays -->
+    <canvas id="grid"></canvas>    <!-- hex geometry + tokens -->
+    <canvas id="swarm"></canvas>   <!-- void swarm: agents -->
+    <canvas id="ui"></canvas>      <!-- hover halo + pulses -->
   </div>
 
   <footer>
-    <span class="chip" id="mode">mode: collapse</span>
-    <span class="chip" id="popMinus">pop −</span>
-    <span class="chip" id="popPlus">pop +</span>
+    <span class="chip" id="swap">swap</span>
+    <span class="chip" id="cal">recalibrate</span>
+    <span class="chip" id="mode">swarm: solo</span>
     <span class="chip" id="clear">clear</span>
-    <textarea id="out" placeholder="(optional) notes / output…"></textarea>
+    <textarea id="out" placeholder="your sentence appears here…"></textarea>
   </footer>
 </div>
 
 <script>
 /* ========================= CONFIG ========================= */
-let MODE_EXPAND = 0;            // 0 = collapse (many→one), 1 = expand (one→many)
-let POP = 6000;                 // starting population (adjustable)
-const MAX_POP = 30000;
+const HEX_RINGS = 4;                 // radius -> rows 5..9..5
+const HEX_SIZE  = 36;
+const LONG_MS   = 380;
+const SEED      = "•";
 
-const ATTR_TOUCH_COLLAPSE = 0.22;   // collapse: attraction to touches
-const ATTR_TOUCH_EXPAND_REP = 0.14; // expand: touch repels (bellows)
-const NOISE = 0.10;
-const DAMP = 0.86;
-const MAXF = 0.8;
-const MAXSPD = 1.8;
+const IMPULSES = ["Explore","Question","Decide","Act","Exist","Again"];
+const LEX = {
+  Explore:["maybe","wander","open","beyond","try","else"],
+  Question:["why","what","how","if","could","when"],
+  Decide:["let's","choose","keep","stop","begin","return"],
+  Act:["make","build","send","move","speak","write"],
+  Exist:["i am","you are","this is","we are","it is","becomes"],
+  Again:["then","again","still","back","once","more"]
+};
+const CONT = ["and","then",",",".","here","now"];
 
-const ECHO_BURST = 300;         // expand: particles per burst
-const ECHO_LIFE  = 240;         // frames
-
-/* frontier (expand prefers unvisited zones) */
-const FW = 64, FH = 40;
+/* swarm */
+const SWARM_COUNT = 240;
+const SWARM_ATTR_TOUCH = 0.22;   // attraction to hover
+const SWARM_ATTR_SUG   = 0.18;   // attraction to active suggestion cells
+const SWARM_NOISE      = 0.12;   // wander
+const SWARM_MAXSPD     = 1.8;
+const SWARM_COMMIT_RADIUS = 28;  // px around cell center
+const SWARM_COMMIT_THRESHOLD = 14; // agents within radius to pulse
+let SWARM_MODE = 0; // 0=solo (draw only), 1=chorus (may auto-commit)
 
 /* ====================== CANVAS SETUP ====================== */
-const cv = document.getElementById('void');
-const cu = document.getElementById('ui');
-const dv = cv.getContext('2d');
-const du = cu.getContext('2d');
+const cg = document.getElementById('grid').getContext('2d');
+const cs = document.getElementById('swarm').getContext('2d');
+const cu = document.getElementById('ui').getContext('2d');
 const out = document.getElementById('out');
-const dpr = Math.max(1, window.devicePixelRatio || 1);
+const dpr = Math.max(1, window.devicePixelRatio||1);
 let W=0,H=0;
 
-function fit(){
-  const parent = cv.parentElement;
-  W = cv.clientWidth  = parent.clientWidth;
-  H = cv.clientHeight = parent.clientHeight;
-  for(const c of [cv, cu]){
-    c.width = W*dpr; c.height = H*dpr;
-    const ctx = c.getContext('2d');
-    ctx.setTransform(dpr,0,0,dpr,0,0);
-  }
+function fit() {
+  const canvases=[cg.canvas,cs.canvas,cu.canvas];
+  W = canvases[0].clientWidth  = canvases[0].parentElement.clientWidth;
+  H = canvases[0].clientHeight = canvases[0].parentElement.clientHeight;
+  for(const c of canvases){ c.width=W*dpr; c.height=H*dpr; c.getContext('2d').setTransform(dpr,0,0,dpr,0,0); }
 }
 window.addEventListener('resize', fit); fit();
 
-/* ========================= STATE ========================== */
-const agents = [];          // swarm
-let visits = new Float32Array(FW*FH);   // frontier heat
-const touches = new Map();  // id -> {x,y} active touches (multi-touch)
+/* ===================== HEX COORDINATES ==================== */
+const SQRT3 = Math.sqrt(3);
+function axialToPixel(q,r,cx,cy,hex=HEX_SIZE){
+  return { x: cx + hex*(SQRT3*q + SQRT3/2*r), y: cy + hex*(3/2*r) };
+}
+function neighborsQR(q,r){ return [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]].map(([dq,dr])=>[q+dq,r+dr]); }
+const k = (q,r)=>`${q},${r}`;
 
-/* helpers */
-function rnd(a=1){ return Math.random()*a; }
-function clamp(v,a,b){ return v<a?a : v>b?b : v; }
-function vibrate(p){ if(navigator.vibrate) navigator.vibrate(p); }
+/* ======================= HIVE MODEL ======================= */
+function buildHive(cx,cy,rings){
+  const cells=new Map(); const arr=[];
+  const c0={q:0,r:0, ...axialToPixel(0,0,cx,cy), token:SEED, kind:"seed", active:false};
+  cells.set(k(0,0),c0); arr.push(c0);
+  for(let n=1;n<=rings;n++){
+    let q=n, r=0; const dirs=[[0,-1],[-1,0],[-1,1],[0,1],[1,0],[1,-1]];
+    for(const [dq,dr] of dirs){ for(let i=0;i<n;i++){
+      if(!cells.has(k(q,r))){ const p=axialToPixel(q,r,cx,cy); const c={q,r,x:p.x,y:p.y,token:"",kind:"",active:false}; cells.set(k(q,r),c); arr.push(c); }
+      q+=dq; r+=dr;
+    }}
+  }
+  // boundary outline
+  const boundary=[]; let q=rings,r=0; const dirs=[[0,-1],[-1,0],[-1,1],[0,1],[1,0],[1,-1]];
+  for(const [dq,dr] of dirs){ for(let i=0;i<rings;i++){ const p=axialToPixel(q,r,cx,cy); boundary.push(p); q+=dq; r+=dr; } }
+  return {cells, arr, boundary, center:{cx,cy}, rings};
+}
 
-/* init swarm */
-function resetSwarm(pop=POP){
-  agents.length = 0;
-  for(let i=0;i<pop;i++){
+/* ===================== DUAL HIVE LAYOUT =================== */
+let leftHigher=true;
+function centers(){
+  const vw=W, vh=H;
+  return leftHigher
+    ? { L:{cx: 0.33*vw, cy: 0.78*vh}, R:{cx: 0.67*vw, cy: 0.825*vh} }
+    : { L:{cx: 0.33*vw, cy: 0.825*vh}, R:{cx: 0.67*vw, cy: 0.78*vh} };
+}
+let {L:CL,R:CR}=centers();
+let HIVE_L=buildHive(CL.cx,CL.cy,HEX_RINGS);
+let HIVE_R=buildHive(CR.cx,CR.cy,HEX_RINGS);
+
+function rebuild(){ ({L:CL,R:CR}=centers()); HIVE_L=buildHive(CL.cx,CL.cy,HEX_RINGS); HIVE_R=buildHive(CR.cx,CR.cy,HEX_RINGS); drawAll(); }
+
+/* ========================= RENDERING ====================== */
+function hexPath(ctx,x,y,hex=HEX_SIZE){
+  ctx.beginPath();
+  for(let i=0;i<6;i++){ const a=Math.PI/6 + i*Math.PI/3;
+    const px=x+hex*Math.cos(a), py=y+hex*Math.sin(a);
+    (i?ctx.lineTo:ctx.moveTo).call(ctx,px,py);
+  } ctx.closePath();
+}
+function drawHive(ctx,hive){
+  ctx.save();
+  // outline
+  ctx.strokeStyle="#333"; ctx.lineWidth=1.2;
+  ctx.beginPath(); hive.boundary.forEach((p,i)=> (i?ctx.lineTo:ctx.moveTo).call(ctx,p.x,p.y)); ctx.closePath(); ctx.stroke();
+  // cells
+  for(const c of hive.arr){
+    const isActive = c.active || c.kind==="seed";
+    ctx.fillStyle = isActive ? "rgba(122,168,255,0.08)" : "transparent";
+    hexPath(ctx,c.x,c.y); ctx.fill();
+    ctx.strokeStyle = isActive ? "#888" : "#333"; ctx.lineWidth = 1;
+    ctx.stroke();
+    if(c.token){
+      ctx.fillStyle="#e7e7e7"; ctx.font="12px ui-monospace,Menlo,monospace";
+      ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.fillText(c.token, c.x, c.y);
+    }
+  }
+  ctx.restore();
+}
+function drawAll(){ cg.clearRect(0,0,W,H); drawHive(cg,HIVE_L); drawHive(cg,HIVE_R); }
+
+/* ===================== INTERACTION STATE ================== */
+let dragging=false, pressTimer=null, hiveCurr=null;
+let seeded=null, current=null;
+let hover=null;
+const V = pat => navigator.vibrate && navigator.vibrate(pat);
+
+function whichHive(x,y){ const dl=Math.hypot(x-CL.cx,y-CL.cy), dr=Math.hypot(x-CR.cx,y-CR.cy); return dl<dr ? HIVE_L : HIVE_R; }
+function pick(hive,x,y){ let best=null,dmin=1e9; for(const c of hive.arr){ const d=Math.hypot(x-c.x,y-c.y); if(d<HEX_SIZE*0.9 && d<dmin){best=c; dmin=d;} } return best; }
+function neighborsOf(h,c){ return neighborsQR(c.q,c.r).map(([q,r])=> h.cells.get(`${q},${r}`)).filter(Boolean); }
+function resetActive(h){ h.arr.forEach(c=>c.active=false); }
+
+function bloom(h,cell){
+  resetActive(h);
+  const nbs = neighborsOf(h,cell);
+  nbs.forEach((n,i)=>{
+    n.active=true;
+    if(cell.kind==="seed"){ n.kind="impulse"; n.token=IMPULSES[i%IMPULSES.length]; }
+    else if(cell.kind==="impulse"){ n.kind="word"; n.token=(LEX[cell.token]||[])[i%6]||""; }
+    else { n.kind="word"; n.token=CONT[i%CONT.length]; }
+  });
+  drawAll();
+}
+
+function append(tok){
+  if(!tok) return;
+  const punct=[",",".",";","?","!"]; let s=out.value;
+  if(punct.includes(tok)) s=s.replace(/\s*$/,"")+tok+" ";
+  else if(s===""||/\s$/.test(s)) s+=tok+" ";
+  else s+=" "+tok+" ";
+  out.value=s; out.selectionStart=out.selectionEnd=s.length;
+}
+
+/* Hover / halo */
+function drawHover(x,y){
+  cu.clearRect(0,0,W,H);
+  if(!x && !y) return;
+  // halo
+  cu.save();
+  const rad = HEX_SIZE*2.4;
+  const grd = cu.createRadialGradient(x,y,4, x,y, rad);
+  grd.addColorStop(0, "rgba(122,168,255,0.22)");
+  grd.addColorStop(1, "rgba(122,168,255,0.0)");
+  cu.fillStyle = grd;
+  cu.beginPath(); cu.arc(x,y,rad,0,6.283); cu.fill();
+  // focus dot
+  cu.fillStyle="rgba(231,231,231,0.75)";
+  cu.beginPath(); cu.arc(x,y,1.5,0,6.283); cu.fill();
+  cu.restore();
+}
+
+/* input */
+function pt(ev){ const r=cg.canvas.getBoundingClientRect(); const e=ev.touches?ev.touches[0]:ev; return {x:e.clientX-r.left,y:e.clientY-r.top}; }
+function down(ev){
+  ev.preventDefault();
+  const {x,y}=pt(ev); hover={x,y}; drawHover(x,y);
+  hiveCurr = whichHive(x,y);
+  const hit = pick(hiveCurr,x,y); if(!hit) return;
+  pressTimer = setTimeout(()=>{ seeded=current=hit; bloom(hiveCurr,hit); V([8,18,8]); dragging=true; }, LONG_MS);
+}
+function move(ev){
+  const {x,y}=pt(ev); hover={x,y}; drawHover(x,y);
+  if(!dragging) return;
+  ev.preventDefault();
+  const hit = pick(hiveCurr,x,y);
+  if(hit && hit!==current && hit.active){ append(hit.token); current=hit; bloom(hiveCurr,hit); V(12); }
+}
+function up(){ clearTimeout(pressTimer); pressTimer=null; dragging=false; }
+
+/* ========================= SWARM ========================== */
+const agents = [];
+function initSwarm(){
+  agents.length=0;
+  for(let i=0;i<SWARM_COUNT;i++){
     agents.push({
-      x: rnd(W), y: rnd(H),
-      vx: (Math.random()*2-1)*0.5,
-      vy: (Math.random()*2-1)*0.5,
-      hue: 205 + rnd(40),
-      echo:false, life:0
+      x: Math.random()*W, y: Math.random()*H,
+      vx: (Math.random()*2-1)*0.5, vy:(Math.random()*2-1)*0.5,
+      hue: 200 + Math.random()*40
     });
   }
 }
-resetSwarm();
+initSwarm();
 
-/* ===================== FRONTIER FIELD ===================== */
-const cellW = ()=> W/FW, cellH = ()=> H/FH;
-
-function markVisit(x,y){
-  const cw=cellW(), ch=cellH();
-  const gx = clamp((x/cw)|0, 0, FW-1);
-  const gy = clamp((y/ch)|0, 0, FH-1);
-  visits[gy*FW + gx] = Math.min(255, visits[gy*FW + gx] + 1);
-}
-function frontierForce(x,y){ // negative gradient (toward less visited)
-  const cw=cellW(), ch=cellH();
-  const gx = clamp((x/cw)|0, 1, FW-2);
-  const gy = clamp((y/ch)|0, 1, FH-2);
-  const idx=(X,Y)=> visits[Y*FW+X];
-  const L=idx(gx-1,gy), R=idx(gx+1,gy), T=idx(gx,gy-1), B=idx(gx,gy+1);
-  return { fx: (L-R)*0.002, fy: (T-B)*0.002 };
-}
-function coolVisits(){ for(let i=0;i<visits.length;i++) visits[i]*=0.995; }
-
-/* ========================= TOUCH ========================== */
-// Multi-touch: track all active touches (both thumbs)
-function setTouch(id,x,y){ touches.set(id,{x,y}); }
-function delTouch(id){ touches.delete(id); }
-function firstTouch(){ // desktop fallback
-  for(const v of touches.values()) return v;
-  return null;
-}
-function drawHalos(){
-  du.clearRect(0,0,W,H);
-  for(const {x,y} of touches.values()){
-    const rad = 80;
-    const grd = du.createRadialGradient(x,y,4, x,y, rad);
-    grd.addColorStop(0,"rgba(122,168,255,0.20)");
-    grd.addColorStop(1,"rgba(122,168,255,0.0)");
-    du.fillStyle = grd;
-    du.beginPath(); du.arc(x,y,rad,0,6.283); du.fill();
-    du.fillStyle="rgba(231,231,231,0.85)";
-    du.beginPath(); du.arc(x,y,2,0,6.283); du.fill();
-  }
+/* nearest active suggestion cells */
+function activeCells(){
+  const list=[];
+  for(const c of HIVE_L.arr) if(c.active && c.token) list.push(c);
+  for(const c of HIVE_R.arr) if(c.active && c.token) list.push(c);
+  return list;
 }
 
-/* Desktop mouse → single “touch” */
-cv.addEventListener('mousedown', (e)=>{
-  const r=cv.getBoundingClientRect(); setTouch('mouse', e.clientX-r.left, e.clientY-r.top); drawHalos();
-});
-window.addEventListener('mousemove', (e)=>{
-  if(!touches.has('mouse')) return;
-  const r=cv.getBoundingClientRect(); setTouch('mouse', e.clientX-r.left, e.clientY-r.top); drawHalos();
-});
-window.addEventListener('mouseup', ()=>{ delTouch('mouse'); drawHalos(); });
+function stepSwarm(){
+  cs.clearRect(0,0,W,H);
+  const actives = activeCells();
+  // count for commit pulses
+  const crowd = new Map(); // cell -> count
+  const nowHover = hover;
 
-/* Mobile multi-touch */
-cv.addEventListener('touchstart', (e)=>{
-  e.preventDefault();
-  const r=cv.getBoundingClientRect();
-  for(const t of e.changedTouches) setTouch(t.identifier, t.clientX-r.left, t.clientY-r.top);
-  drawHalos();
-},{passive:false});
-cv.addEventListener('touchmove', (e)=>{
-  e.preventDefault();
-  const r=cv.getBoundingClientRect();
-  for(const t of e.changedTouches) setTouch(t.identifier, t.clientX-r.left, t.clientY-r.top);
-  drawHalos();
-},{passive:false});
-cv.addEventListener('touchend', (e)=>{
-  for(const t of e.changedTouches) delTouch(t.identifier);
-  drawHalos();
-});
-
-/* simple “burst” on long press in EXPAND mode */
-let pressTimer=null;
-cv.addEventListener('touchstart', ()=>{
-  if(!MODE_EXPAND) return;
-  clearTimeout(pressTimer);
-  pressTimer = setTimeout(()=>{
-    const f = firstTouch(); if(!f) return;
-    for(let i=0;i<ECHO_BURST;i++){
-      agents.push({ x:f.x, y:f.y, vx:(Math.random()*2-1)*1.5, vy:(Math.random()*2-1)*1.5,
-                    hue:205+rnd(30), echo:true, life:ECHO_LIFE });
-    }
-    vibrate([10,20,10]);
-  }, 380);
-},{passive:true});
-cv.addEventListener('touchend', ()=> clearTimeout(pressTimer));
-
-/* ========================= PHYSICS ======================== */
-function step(){
-  dv.clearRect(0,0,W,H);
-  coolVisits();
-
-  // draw + advance agents
-  for(let i=0;i<agents.length;i++){
-    const a = agents[i];
+  for(const a of agents){
+    // forces
     let ax=0, ay=0;
 
-    if (MODE_EXPAND && a.echo){
-      // repel from each touch (bellows)
-      for(const {x:tx,y:ty} of touches.values()){
-        const dx = a.x - tx, dy = a.y - ty;
-        const d = Math.hypot(dx,dy)+1e-3;
-        const f = ATTR_TOUCH_EXPAND_REP * Math.min(1, 140/d);
-        ax += f*dx; ay += f*dy;
-      }
-      // attract to frontier (less visited)
-      const ff = frontierForce(a.x,a.y);
-      ax += ff.fx * 0.10;
-      ay += ff.fy * 0.10;
-
-      // small noise
-      ax += (Math.random()*2-1)*NOISE;
-      ay += (Math.random()*2-1)*NOISE;
-
-    } else {
-      // COLLAPSE (or non-echo particles): attract to all touches
-      for(const {x:tx,y:ty} of touches.values()){
-        const dx = tx - a.x, dy = ty - a.y;
-        const d = Math.hypot(dx,dy)+1e-3;
-        const f = ATTR_TOUCH_COLLAPSE * Math.min(1, 140/d);
-        ax += f*dx; ay += f*dy;
-      }
-      // wander
-      ax += (Math.random()*2-1)*NOISE;
-      ay += (Math.random()*2-1)*NOISE;
+    // attraction to hover field (your touch)
+    if(nowHover){
+      const dx = nowHover.x - a.x, dy = nowHover.y - a.y;
+      const d = Math.hypot(dx,dy)+1e-3;
+      const f = SWARM_ATTR_TOUCH * Math.min(1, 140/d);
+      ax += f * dx; ay += f * dy;
     }
 
-    // normalize & damp
-    const fmag = Math.hypot(ax,ay) || 1;
-    const s = Math.min(1, MAXF/fmag);
-    ax*=s; ay*=s;
-    a.vx = clamp((a.vx + ax*0.08)*DAMP, -MAXSPD, MAXSPD);
-    a.vy = clamp((a.vy + ay*0.08)*DAMP, -MAXSPD, MAXSPD);
+    // attraction to active suggestion cells
+    for(const c of actives){
+      const dx = c.x - a.x, dy = c.y - a.y;
+      const d = Math.hypot(dx,dy)+1e-3;
+      const f = SWARM_ATTR_SUG * Math.min(1, 120/d);
+      ax += f * dx; ay += f * dy;
+
+      // crowd count for commit
+      if(d < SWARM_COMMIT_RADIUS){
+        const id = c; crowd.set(id, (crowd.get(id)||0)+1);
+      }
+    }
+
+    // noise / wander
+    ax += (Math.random()*2-1) * SWARM_NOISE;
+    ay += (Math.random()*2-1) * SWARM_NOISE;
+
+    // integrate
+    a.vx = Math.max(-SWARM_MAXSPD, Math.min(SWARM_MAXSPD, a.vx + ax*0.05));
+    a.vy = Math.max(-SWARM_MAXSPD, Math.min(SWARM_MAXSPD, a.vy + ay*0.05));
     a.x += a.vx; a.y += a.vy;
 
     // wrap
     if(a.x<0) a.x+=W; if(a.x>W) a.x-=W;
     if(a.y<0) a.y+=H; if(a.y>H) a.y-=H;
 
-    // mark usage for frontier
-    markVisit(a.x, a.y);
-
-    // echo lifetime
-    if (a.echo && MODE_EXPAND){
-      a.life -= 1; if(a.life<=0){ agents.splice(i--,1); continue; }
-    }
-
     // draw
-    const alpha = a.echo ? Math.max(0.12, a.life/ECHO_LIFE)*0.6 : 0.55;
-    dv.fillStyle = `hsla(${a.hue},90%,70%,${alpha})`;
-    dv.beginPath(); dv.arc(a.x,a.y, a.echo?0.9:1.1, 0, 6.283); dv.fill();
+    cs.fillStyle=`hsla(${a.hue},90%,70%,0.55)`;
+    cs.beginPath(); cs.arc(a.x,a.y,1.1,0,6.283); cs.fill();
   }
 
-  requestAnimationFrame(step);
+  // pulse cells with enough swarm nearby; in chorus, auto-commit
+  for(const [cell,count] of crowd.entries()){
+    if(count >= SWARM_COMMIT_THRESHOLD){
+      pulseCell(cell);
+      if(SWARM_MODE===1){ append(cell.token); V(10); bloom(whichHive(cell.x,cell.y), cell); }
+    }
+  }
+
+  requestAnimationFrame(stepSwarm);
 }
-requestAnimationFrame(step);
+requestAnimationFrame(stepSwarm);
 
-/* ========================= UI CHIPS ======================= */
-const modeBtn = document.getElementById('mode');
-modeBtn.onclick = ()=>{
-  MODE_EXPAND = 1 - MODE_EXPAND;
-  modeBtn.classList.toggle('on', MODE_EXPAND===1);
-  modeBtn.textContent = 'mode: ' + (MODE_EXPAND ? 'expand' : 'collapse');
-};
+function pulseCell(c){
+  cu.save();
+  cu.strokeStyle="rgba(122,168,255,0.45)";
+  cu.lineWidth=3; hexPath(cu,c.x,c.y); cu.stroke();
+  cu.restore();
+}
 
-document.getElementById('clear').onclick = ()=>{
-  out.value = '';
-  // also clear visits so frontier resets
-  visits = new Float32Array(FW*FH);
+/* ==================== CONTROLS / START ==================== */
+document.getElementById('swap').onclick=()=>{ leftHigher=!leftHigher; rebuild(); };
+document.getElementById('clear').onclick=()=>{ out.value=""; };
+document.getElementById('cal').onclick=async()=>{
+  alert("Calibration: tap once where your LEFT thumb naturally rests, then tap where your RIGHT thumb rests.");
+  const pickTap=()=>new Promise(res=>{
+    const handler=e=>{ const {x,y}=pt(e); window.removeEventListener('mousedown',handler); window.removeEventListener('touchstart',handler); res({x,y}); };
+    window.addEventListener('mousedown',handler,{once:true});
+    window.addEventListener('touchstart',handler,{once:true});
+  });
+  const L=await pickTap(); const R=await pickTap();
+  CL={cx:L.x, cy:L.y}; CR={cx:R.x, cy:R.y};
+  HIVE_L=buildHive(CL.cx,CL.cy,HEX_RINGS); HIVE_R=buildHive(CR.cx,CR.cy,HEX_RINGS); drawAll();
 };
+const modeBtn=document.getElementById('mode');
+modeBtn.onclick=()=>{ SWARM_MODE = (SWARM_MODE+1)%2; modeBtn.classList.toggle('on', SWARM_MODE===1); modeBtn.textContent = 'swarm: ' + (SWARM_MODE? 'chorus':'solo'); };
 
-document.getElementById('popPlus').onclick = ()=>{
-  const add = Math.min(2000, MAX_POP-POP);
-  POP += add;
-  for(let i=0;i<add;i++)
-    agents.push({x:rnd(W),y:rnd(H),vx:(Math.random()*2-1)*0.5,vy:(Math.random()*2-1)*0.5,hue:205+rnd(40),echo:false,life:0});
-};
-document.getElementById('popMinus').onclick = ()=>{
-  const cut = Math.min(2000, POP);
-  POP -= cut;
-  agents.splice(0, cut);
-};
+function drawAllAndStart(){ drawAll(); initSwarm(); }
+drawAllAndStart();
+
+/* input listeners last */
+cg.canvas.addEventListener('mousedown',down);
+cg.canvas.addEventListener('touchstart',down,{passive:false});
+window.addEventListener('mousemove',move);
+window.addEventListener('touchmove',move,{passive:false});
+window.addEventListener('mouseup',up);
+window.addEventListener('touchend',up);
 </script>
