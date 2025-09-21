@@ -1,329 +1,281 @@
 <!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-<title>Horde — camera + infinite zoom + BW LUT + glow + grain</title>
+<title>Horde — pure canvas, dual-touch</title>
 <style>
   :root { --bg:#0b0b0b; --fg:#e7e7e7; --stroke:#2a2a2a; --accent:#7aa8ff; }
-  html,body { margin:0; height:100%; background:#000; color:var(--fg);
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .wrap { display:grid; grid-template-rows:auto 1fr auto; height:100%; }
   header, footer { padding:8px 12px; border-bottom:1px solid var(--stroke); }
   footer { border-top:1px solid var(--stroke); border-bottom:none; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  .stack { position:relative; overflow:hidden; background:#000; }
+  .stack { position:relative; overflow:hidden; }
   canvas { position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none; }
   .chip { padding:4px 10px; border:1px solid #333; border-radius:999px; font-size:12px; cursor:pointer; user-select:none; }
   .chip.on { color:var(--accent); border-color:var(--accent); }
-  #out { min-height:64px; flex:1; background:#0a0a0a; color:#ddd; border:1px solid #222; border-radius:6px; padding:10px; }
+  #out { min-height:70px; flex:1; background:#0f0f0f; color:var(--fg); border:1px solid #242424; border-radius:6px; padding:10px; }
 </style>
 
 <div class="wrap">
-  <header>horde — camera controls: one finger = attractor • two fingers = pan/zoom • wheel = zoom at cursor</header>
+  <header>horde — pure canvas • dual-touch • expand/collapse • v0.2</header>
 
   <div class="stack">
-    <!-- We draw the swarm to an offscreen 'scene' canvas, post-process to 'fx',
-         then present into this on-screen 'view' canvas with camera transform. -->
-    <canvas id="view"></canvas>
-    <canvas id="ui"></canvas>
+    <canvas id="void"></canvas>   <!-- swarm -->
+    <canvas id="ui"></canvas>     <!-- halos, overlays -->
   </div>
 
   <footer>
     <span class="chip" id="mode">mode: collapse</span>
     <span class="chip" id="popMinus">pop −</span>
     <span class="chip" id="popPlus">pop +</span>
-    <span class="chip" id="camReset">camera reset</span>
-    <span class="chip on" id="bw">BW</span>
-    <span class="chip on" id="glow">glow</span>
-    <span class="chip on" id="grain">grain</span>
     <span class="chip" id="clear">clear</span>
-    <textarea id="out" placeholder="notes…"></textarea>
+    <textarea id="out" placeholder="(optional) notes / output…"></textarea>
   </footer>
 </div>
 
 <script>
-/* ========================= SETTINGS ========================= */
-let MODE_EXPAND = 0;                // 0 collapse, 1 expand
-let POP = 12000;                    // try 24_000 on fast devices
+/* ========================= CONFIG ========================= */
+let MODE_EXPAND = 1;            // 0 = collapse (many→one), 1 = expand (one→many)
+let POP = 6000;                 // starting population (adjustable)
+const MAX_POP = 30000;
 
-// forces
-const ATTR_TOUCH_COLLAPSE = 0.22;
-const ATTR_TOUCH_EXPAND_REP = 0.14;
+const ATTR_TOUCH_COLLAPSE = 0.22;   // collapse: attraction to touches
+const ATTR_TOUCH_EXPAND_REP = 0.14; // expand: touch repels (bellows)
 const NOISE = 0.10;
 const DAMP = 0.86;
 const MAXF = 0.8;
 const MAXSPD = 1.8;
 
-// expansion
-const ECHO_BURST = 300;
-const ECHO_LIFE  = 240;
+const ECHO_BURST = 300;         // expand: particles per burst
+const ECHO_LIFE  = 240;         // frames
 
-// post
-let USE_BW = 1, USE_GLOW = 1, USE_GRAIN = 1;
+/* frontier (expand prefers unvisited zones) */
+const FW = 64, FH = 40;
 
-/* ====================== CANVASES / CAMERA =================== */
-const cView = document.getElementById('view');   // on-screen composite
-const cUI   = document.getElementById('ui');     // halos, cursors
-const vtx = cView.getContext('2d');
-const utx = cUI.getContext('2d');
-
-// offscreen render chain
-const cScene = document.createElement('canvas'); // swarm in world coords
-const sTX    = cScene.getContext('2d');
-const cFX    = document.createElement('canvas'); // postprocessing (glow/LUT/grain)
-const fTX    = cFX.getContext('2d');
-
-const DPR = Math.max(1, window.devicePixelRatio||1);
-let VW=0,VH=0; // view size in CSS px
-
-// world camera (pan+zoom)
-const cam = { x:0, y:0, z:1 };  // world → view: (p - cam)/z centered in view
+/* ====================== CANVAS SETUP ====================== */
+const cv = document.getElementById('void');
+const cu = document.getElementById('ui');
+const dv = cv.getContext('2d');
+const du = cu.getContext('2d');
+const out = document.getElementById('out');
+const dpr = Math.max(1, window.devicePixelRatio || 1);
+let W=0,H=0;
 
 function fit(){
-  const par = cView.parentElement;
-  VW = cView.clientWidth  = par.clientWidth;
-  VH = cView.clientHeight = par.clientHeight;
-
-  for(const c of [cView,cUI]){
-    c.width = VW*DPR; c.height = VH*DPR;
-    const ctx=c.getContext('2d'); ctx.setTransform(DPR,0,0,DPR,0,0);
+  const parent = cv.parentElement;
+  W = cv.clientWidth  = parent.clientWidth;
+  H = cv.clientHeight = parent.clientHeight;
+  for(const c of [cv, cu]){
+    c.width = W*dpr; c.height = H*dpr;
+    const ctx = c.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
   }
-
-  // offscreens at view resolution (we're postprocessing in screen space)
-  cScene.width = VW; cScene.height = VH;
-  cFX.width    = VW; cFX.height    = VH;
 }
 window.addEventListener('resize', fit); fit();
 
-/* ============================ SWARM ========================= */
-const agents = [];
-function seed(pop=POP){
+/* ========================= STATE ========================== */
+const agents = [];          // swarm
+let visits = new Float32Array(FW*FH);   // frontier heat
+const touches = new Map();  // id -> {x,y} active touches (multi-touch)
+
+/* helpers */
+function rnd(a=1){ return Math.random()*a; }
+function clamp(v,a,b){ return v<a?a : v>b?b : v; }
+function vibrate(p){ if(navigator.vibrate) navigator.vibrate(p); }
+
+/* init swarm */
+function resetSwarm(pop=POP){
   agents.length = 0;
   for(let i=0;i<pop;i++){
     agents.push({
-      x: (Math.random()-0.5)*2000,   // world coords ~ centered
-      y: (Math.random()-0.5)*2000,
-      vx:(Math.random()*2-1)*0.5,
-      vy:(Math.random()*2-1)*0.5,
+      x: rnd(W), y: rnd(H),
+      vx: (Math.random()*2-1)*0.5,
+      vy: (Math.random()*2-1)*0.5,
+      hue: 205 + rnd(40),
       echo:false, life:0
     });
   }
 }
-seed();
+resetSwarm();
 
-/* world<>view transforms */
-function toView(x,y){ return { x: (x-cam.x)/cam.z + VW/2, y: (y-cam.y)/cam.z + VH/2 }; }
-function toWorld(x,y){ return { x: (x - VW/2)*cam.z + cam.x, y: (y - VH/2)*cam.z + cam.y }; }
+/* ===================== FRONTIER FIELD ===================== */
+const cellW = ()=> W/FW, cellH = ()=> H/FH;
 
-/* ======================== TOUCH / INPUT ===================== */
-const touches = new Map(); // id → {x,y} in view px
+function markVisit(x,y){
+  const cw=cellW(), ch=cellH();
+  const gx = clamp((x/cw)|0, 0, FW-1);
+  const gy = clamp((y/ch)|0, 0, FH-1);
+  visits[gy*FW + gx] = Math.min(255, visits[gy*FW + gx] + 1);
+}
+function frontierForce(x,y){ // negative gradient (toward less visited)
+  const cw=cellW(), ch=cellH();
+  const gx = clamp((x/cw)|0, 1, FW-2);
+  const gy = clamp((y/ch)|0, 1, FH-2);
+  const idx=(X,Y)=> visits[Y*FW+X];
+  const L=idx(gx-1,gy), R=idx(gx+1,gy), T=idx(gx,gy-1), B=idx(gx,gy+1);
+  return { fx: (L-R)*0.002, fy: (T-B)*0.002 };
+}
+function coolVisits(){ for(let i=0;i<visits.length;i++) visits[i]*=0.995; }
+
+/* ========================= TOUCH ========================== */
+// Multi-touch: track all active touches (both thumbs)
+function setTouch(id,x,y){ touches.set(id,{x,y}); }
+function delTouch(id){ touches.delete(id); }
+function firstTouch(){ // desktop fallback
+  for(const v of touches.values()) return v;
+  return null;
+}
 function drawHalos(){
-  utx.clearRect(0,0,VW,VH);
+  du.clearRect(0,0,W,H);
   for(const {x,y} of touches.values()){
-    utx.save();
-    const rad = 90;
-    const g=utx.createRadialGradient(x,y,4, x,y, rad);
-    g.addColorStop(0,"rgba(122,168,255,0.20)");
-    g.addColorStop(1,"rgba(122,168,255,0.0)");
-    utx.fillStyle=g; utx.beginPath(); utx.arc(x,y,rad,0,6.283); utx.fill();
-    utx.fillStyle="rgba(235,235,235,0.9)"; utx.beginPath(); utx.arc(x,y,2,0,6.283); utx.fill();
-    utx.restore();
+    const rad = 80;
+    const grd = du.createRadialGradient(x,y,4, x,y, rad);
+    grd.addColorStop(0,"rgba(122,168,255,0.20)");
+    grd.addColorStop(1,"rgba(122,168,255,0.0)");
+    du.fillStyle = grd;
+    du.beginPath(); du.arc(x,y,rad,0,6.283); du.fill();
+    du.fillStyle="rgba(231,231,231,0.85)";
+    du.beginPath(); du.arc(x,y,2,0,6.283); du.fill();
   }
 }
 
-// one-finger = attractor, two-finger = pan+zoom
-let pinch = null; // {id1,id2, startDist, startZ, startCam}
-function dist(a,b){ const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy); }
+/* Desktop mouse → single “touch” */
+cv.addEventListener('mousedown', (e)=>{
+  const r=cv.getBoundingClientRect(); setTouch('mouse', e.clientX-r.left, e.clientY-r.top); drawHalos();
+});
+window.addEventListener('mousemove', (e)=>{
+  if(!touches.has('mouse')) return;
+  const r=cv.getBoundingClientRect(); setTouch('mouse', e.clientX-r.left, e.clientY-r.top); drawHalos();
+});
+window.addEventListener('mouseup', ()=>{ delTouch('mouse'); drawHalos(); });
 
-cView.addEventListener('touchstart', (e)=>{
+/* Mobile multi-touch */
+cv.addEventListener('touchstart', (e)=>{
   e.preventDefault();
-  const r=cView.getBoundingClientRect();
-  for(const t of e.changedTouches) touches.set(t.identifier,{x:(t.clientX-r.left), y:(t.clientY-r.top)});
-  if(touches.size===2){
-    const [a,b] = [...touches.values()];
-    pinch = { ids:[...touches.keys()], startDist:dist(a,b), startZ:cam.z, startCam:{x:cam.x,y:cam.y} };
-  }
+  const r=cv.getBoundingClientRect();
+  for(const t of e.changedTouches) setTouch(t.identifier, t.clientX-r.left, t.clientY-r.top);
   drawHalos();
 },{passive:false});
-
-cView.addEventListener('touchmove',(e)=>{
+cv.addEventListener('touchmove', (e)=>{
   e.preventDefault();
-  const r=cView.getBoundingClientRect();
-  for(const t of e.changedTouches) touches.set(t.identifier,{x:(t.clientX-r.left), y:(t.clientY-r.top)});
-  if(pinch && touches.has(pinch.ids[0]) && touches.has(pinch.ids[1])){
-    const a=touches.get(pinch.ids[0]), b=touches.get(pinch.ids[1]);
-    const d=dist(a,b);
-    const scale = clamp(pinch.startZ * (pinch.startDist/d), 0.1, 50); // pinch to zoom
-    // zoom around midpoint
-    const mid = { x:(a.x+b.x)/2, y:(a.y+b.y)/2 };
-    const before = toWorld(mid.x, mid.y);
-    cam.z = scale;
-    const after  = toWorld(mid.x, mid.y);
-    cam.x += before.x - after.x; cam.y += before.y - after.y;
-
-    // pan by moving midpoint
-    const mdiff = { x:mid.x - VW/2, y:mid.y - VH/2 };
-    cam.x -= mdiff.x*cam.z*0.02;
-    cam.y -= mdiff.y*cam.z*0.02;
-  }
+  const r=cv.getBoundingClientRect();
+  for(const t of e.changedTouches) setTouch(t.identifier, t.clientX-r.left, t.clientY-r.top);
   drawHalos();
 },{passive:false});
-
-cView.addEventListener('touchend',(e)=>{
-  for(const t of e.changedTouches) touches.delete(t.identifier);
-  if(touches.size<2) pinch=null;
+cv.addEventListener('touchend', (e)=>{
+  for(const t of e.changedTouches) delTouch(t.identifier);
   drawHalos();
 });
 
-// Desktop: wheel zoom at cursor, right-drag pan, left = attractor
-cView.addEventListener('wheel',(e)=>{
-  e.preventDefault();
-  const zoom = Math.exp(-e.deltaY*0.0015);
-  const mx = e.offsetX, my = e.offsetY;
-  const pre = toWorld(mx,my);
-  cam.z = clamp(cam.z/zoom, 0.1, 50);
-  const post= toWorld(mx,my);
-  cam.x += pre.x-post.x; cam.y += pre.y-post.y;
-},{passive:false});
-
-let panning=false, last={x:0,y:0};
-cView.addEventListener('mousedown',(e)=>{ if(e.button===2){ panning=true; last={x:e.offsetX,y:e.offsetY}; } else touches.set('mouse',{x:e.offsetX,y:e.offsetY}); drawHalos(); });
-window.addEventListener('mousemove',(e)=>{
-  if(panning){ const dx=e.offsetX-last.x, dy=e.offsetY-last.y; last={x:e.offsetX,y:e.offsetY}; cam.x += dx*cam.z; cam.y += dy*cam.z; }
-  else if(touches.has('mouse')) { touches.set('mouse',{x:e.offsetX,y:e.offsetY}); drawHalos(); }
-});
-window.addEventListener('mouseup',()=>{ panning=false; touches.delete('mouse'); drawHalos(); });
-window.addEventListener('contextmenu',(e)=>e.preventDefault());
-
-/* expansion burst on long press */
+/* simple “burst” on long press in EXPAND mode */
 let pressTimer=null;
-cView.addEventListener('touchstart', ()=>{
+cv.addEventListener('touchstart', ()=>{
   if(!MODE_EXPAND) return;
   clearTimeout(pressTimer);
   pressTimer = setTimeout(()=>{
-    const f = touches.values().next().value; if(!f) return;
-    const w = toWorld(f.x,f.y);
+    const f = firstTouch(); if(!f) return;
     for(let i=0;i<ECHO_BURST;i++){
-      agents.push({ x:w.x, y:w.y, vx:(Math.random()*2-1)*1.5, vy:(Math.random()*2-1)*1.5, echo:true, life:ECHO_LIFE });
+      agents.push({ x:f.x, y:f.y, vx:(Math.random()*2-1)*1.5, vy:(Math.random()*2-1)*1.5,
+                    hue:205+rnd(30), echo:true, life:ECHO_LIFE });
     }
-    if(navigator.vibrate) navigator.vibrate([10,20,10]);
+    vibrate([10,20,10]);
   }, 380);
 },{passive:true});
-cView.addEventListener('touchend', ()=> clearTimeout(pressTimer));
+cv.addEventListener('touchend', ()=> clearTimeout(pressTimer));
 
-/* ========================= PHYSICS ========================= */
+/* ========================= PHYSICS ======================== */
 function step(){
-  // draw swarm to scene (screen-space but with camera transform)
-  sTX.setTransform(1,0,0,1,0,0);
-  sTX.clearRect(0,0,VW,VH);
-  sTX.save();
-  // world→view transform
-  sTX.translate(VW/2, VH/2);
-  sTX.scale(1/cam.z, 1/cam.z);
-  sTX.translate(-cam.x, -cam.y);
+  dv.clearRect(0,0,W,H);
+  coolVisits();
 
-  // compute view-space touch points as world coords
-  const worldTouches = [...touches.values()].map(p=>toWorld(p.x,p.y));
-
-  for(let i=agents.length-1;i>=0;i--){
+  // draw + advance agents
+  for(let i=0;i<agents.length;i++){
     const a = agents[i];
     let ax=0, ay=0;
 
     if (MODE_EXPAND && a.echo){
-      // repel from touches
-      for(const t of worldTouches){
-        const dx=a.x-t.x, dy=a.y-t.y; const d=Math.hypot(dx,dy)+1e-3;
-        const f=ATTR_TOUCH_EXPAND_REP*Math.min(1,140/d);
-        ax+=f*dx; ay+=f*dy;
+      // repel from each touch (bellows)
+      for(const {x:tx,y:ty} of touches.values()){
+        const dx = a.x - tx, dy = a.y - ty;
+        const d = Math.hypot(dx,dy)+1e-3;
+        const f = ATTR_TOUCH_EXPAND_REP * Math.min(1, 140/d);
+        ax += f*dx; ay += f*dy;
       }
+      // attract to frontier (less visited)
+      const ff = frontierForce(a.x,a.y);
+      ax += ff.fx * 0.10;
+      ay += ff.fy * 0.10;
+
+      // small noise
       ax += (Math.random()*2-1)*NOISE;
       ay += (Math.random()*2-1)*NOISE;
+
     } else {
-      // attract to touches
-      for(const t of worldTouches){
-        const dx=t.x-a.x, dy=t.y-a.y; const d=Math.hypot(dx,dy)+1e-3;
-        const f=ATTR_TOUCH_COLLAPSE*Math.min(1,140/d);
-        ax+=f*dx; ay+=f*dy;
+      // COLLAPSE (or non-echo particles): attract to all touches
+      for(const {x:tx,y:ty} of touches.values()){
+        const dx = tx - a.x, dy = ty - a.y;
+        const d = Math.hypot(dx,dy)+1e-3;
+        const f = ATTR_TOUCH_COLLAPSE * Math.min(1, 140/d);
+        ax += f*dx; ay += f*dy;
       }
+      // wander
       ax += (Math.random()*2-1)*NOISE;
       ay += (Math.random()*2-1)*NOISE;
     }
 
     // normalize & damp
-    const fmag=Math.hypot(ax,ay)||1, s=Math.min(1,MAXF/fmag); ax*=s; ay*=s;
-    a.vx = Math.max(-MAXSPD, Math.min(MAXSPD, (a.vx + ax*0.08)*DAMP));
-    a.vy = Math.max(-MAXSPD, Math.min(MAXSPD, (a.vy + ay*0.08)*DAMP));
+    const fmag = Math.hypot(ax,ay) || 1;
+    const s = Math.min(1, MAXF/fmag);
+    ax*=s; ay*=s;
+    a.vx = clamp((a.vx + ax*0.08)*DAMP, -MAXSPD, MAXSPD);
+    a.vy = clamp((a.vy + ay*0.08)*DAMP, -MAXSPD, MAXSPD);
     a.x += a.vx; a.y += a.vy;
 
-    if (a.echo && MODE_EXPAND && --a.life<=0){ agents.splice(i,1); continue; }
+    // wrap
+    if(a.x<0) a.x+=W; if(a.x>W) a.x-=W;
+    if(a.y<0) a.y+=H; if(a.y>H) a.y-=H;
 
-    // draw particle (subpixel helps at deep zoom)
-    const r = a.echo ? 0.9 : 1.1;
-    sTX.fillStyle = "#9ebcff";
-    sTX.beginPath(); sTX.arc(a.x, a.y, r, 0, 6.283); sTX.fill();
-  }
-  sTX.restore();
+    // mark usage for frontier
+    markVisit(a.x, a.y);
 
-  // === POST: BW LUT + GLOW + GRAIN into fTX ===
-  // 1) copy scene
-  fTX.setTransform(1,0,0,1,0,0);
-  fTX.clearRect(0,0,VW,VH);
-  fTX.drawImage(cScene,0,0);
-
-  // 2) BW LUT (simple contrast curve)
-  if(USE_BW){
-    const img = fTX.getImageData(0,0,VW,VH);
-    const d = img.data;
-    for(let i=0;i<d.length;i+=4){
-      const r=d[i], g=d[i+1], b=d[i+2];
-      let y = (0.2126*r + 0.7152*g + 0.0722*b);      // luminance
-      // contrast curve + slight bloom bias
-      y = Math.pow(y/255, 0.85) * 255;
-      d[i]=d[i+1]=d[i+2]=y;
+    // echo lifetime
+    if (a.echo && MODE_EXPAND){
+      a.life -= 1; if(a.life<=0){ agents.splice(i--,1); continue; }
     }
-    fTX.putImageData(img,0,0);
-  }
 
-  // 3) Glow (two-pass blur add)
-  if(USE_GLOW){
-    fTX.globalCompositeOperation='lighter';
-    fTX.filter='blur(2px)'; fTX.drawImage(cScene,0,0);
-    fTX.filter='blur(6px)'; fTX.drawImage(cScene,0,0);
-    fTX.filter='none'; fTX.globalCompositeOperation='source-over';
+    // draw
+    const alpha = a.echo ? Math.max(0.12, a.life/ECHO_LIFE)*0.6 : 0.55;
+    dv.fillStyle = `hsla(${a.hue},90%,70%,${alpha})`;
+    dv.beginPath(); dv.arc(a.x,a.y, a.echo?0.9:1.1, 0, 6.283); dv.fill();
   }
-
-  // 4) Grain (dynamic)
-  if(USE_GRAIN){
-    const gsz=VW*VH*0.15|0;
-    const img = fTX.getImageData(0,0,VW,VH);
-    const d=img.data;
-    for(let i=0;i<gsz;i++){
-      const p=((Math.random()*VW)|0 + ((Math.random()*VH)|0)*VW)<<2;
-      const n=(Math.random()*40-20)|0; // ± grain
-      d[p]   = Math.max(0, Math.min(255, d[p]  + n));
-      d[p+1] = Math.max(0, Math.min(255, d[p+1]+ n));
-      d[p+2] = Math.max(0, Math.min(255, d[p+2]+ n));
-    }
-    fTX.putImageData(img,0,0);
-  }
-
-  // === PRESENT: draw post image to view canvas ===
-  vtx.setTransform(1,0,0,1,0,0);
-  vtx.clearRect(0,0,VW,VH);
-  vtx.drawImage(cFX,0,0);
 
   requestAnimationFrame(step);
 }
 requestAnimationFrame(step);
 
-/* ============================ UI =========================== */
-const out = document.getElementById('out');
-const $ = id => document.getElementById(id);
+/* ========================= UI CHIPS ======================= */
+const modeBtn = document.getElementById('mode');
+modeBtn.onclick = ()=>{
+  MODE_EXPAND = 1 - MODE_EXPAND;
+  modeBtn.classList.toggle('on', MODE_EXPAND===1);
+  modeBtn.textContent = 'mode: ' + (MODE_EXPAND ? 'expand' : 'collapse');
+};
 
-$('mode').onclick = ()=>{ MODE_EXPAND ^= 1; $('mode').classList.toggle('on', MODE_EXPAND); $('mode').textContent = 'mode: ' + (MODE_EXPAND?'expand':'collapse'); };
-$('popPlus').onclick = ()=>{ for(let i=0;i<2000;i++) agents.push({x:(Math.random()-0.5)*2000,y:(Math.random()-0.5)*2000,vx:(Math.random()*2-1)*0.5,vy:(Math.random()*2-1)*0.5,echo:false,life:0}); POP+=2000; };
-$('popMinus').onclick= ()=>{ agents.splice(0, Math.min(2000, agents.length)); POP=Math.max(0,POP-2000); };
-$('camReset').onclick= ()=>{ cam.x=0; cam.y=0; cam.z=1; };
-$('bw').onclick   = ()=>{ USE_BW   ^=1; $('bw').classList.toggle('on',USE_BW); };
-$('glow').onclick = ()=>{ USE_GLOW ^=1; $('glow').classList.toggle('on',USE_GLOW); };
-$('grain').onclick= ()=>{ USE_GRAIN^=1; $('grain').classList.toggle('on',USE_GRAIN); };
-$('clear').onclick= ()=>{ out.value=''; };
+document.getElementById('clear').onclick = ()=>{
+  out.value = '';
+  // also clear visits so frontier resets
+  visits = new Float32Array(FW*FH);
+};
+
+document.getElementById('popPlus').onclick = ()=>{
+  const add = Math.min(2000, MAX_POP-POP);
+  POP += add;
+  for(let i=0;i<add;i++)
+    agents.push({x:rnd(W),y:rnd(H),vx:(Math.random()*2-1)*0.5,vy:(Math.random()*2-1)*0.5,hue:205+rnd(40),echo:false,life:0});
+};
+document.getElementById('popMinus').onclick = ()=>{
+  const cut = Math.min(2000, POP);
+  POP -= cut;
+  agents.splice(0, cut);
+};
 </script>
